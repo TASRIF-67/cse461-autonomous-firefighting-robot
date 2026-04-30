@@ -5,435 +5,526 @@
  * ============================================================
  *  Hardware: Arduino UNO
  *
- *  This sketch is the primary brain of FireBot. It handles:
- *    - Continuous sensor reading (DHT11, HC-SR04, MQ-2, flame x3, LDR)
- *    - Obstacle detection and avoidance
- *    - Smoke / flame detection and high alert mode
- *    - Flame direction scanning and robot alignment
- *    - Water pump activation and servo nozzle sweep
- *    - Sending telemetry to ESP32-CAM over UART
+ *  Active features in this build:
+ *    - Temperature only (DHT11)
+ *    - Flame detection x3 (analog)
+ *    - Gas/smoke detection (MQ-2 analog)
+ *    - Obstacle avoidance (HC-SR04)
+ *    - Motor drive — full speed, fixed direction only
+ *    - Water pump via relay
+ *    - Nozzle servo sweep
+ *    - Red LED alert
+ *    - UART telemetry to ESP32-CAM
  *
- *  Operational flow:
- *    Initialize → Read sensors → Obstacle? → Flame/Smoke? →
- *    High Alert → Align → Suppress → Verify → Resume patrol
+ *  Disabled / commented-out features:
+ *    - Humidity reading        → search "UNCOMMENT: HUMIDITY"
+ *    - Headlight LED           → search "UNCOMMENT: HEADLIGHT"
+ *    - Water level sensor      → search "UNCOMMENT: WATER LEVEL"
+ *    - Variable speed control  → search "UNCOMMENT: SPEED CONTROL"
+ *    - Buzzer                  → search "UNCOMMENT: BUZZER"
+ *
+ *  Pin Map:
+ *    A0  = MQ-2 analog gas level
+ *    A1  = Flame sensor LEFT   (analog, lower value = stronger flame)
+ *    A2  = Flame sensor CENTER (analog)
+ *    A3  = Flame sensor RIGHT  (analog)
+ *    D2  = Relay IN — pump, active LOW
+ *    D3  = Servo signal — nozzle sweep
+ *    D5  = HC-SR04 TRIG
+ *    D6  = HC-SR04 ECHO
+ *    D7  = DHT11 data
+ *    D9  = Red alert LED
+ *    D10 = L298N IN1 (left  motors — direction A)
+ *    D11 = L298N IN2 (left  motors — direction B)
+ *    D12 = L298N IN3 (right motors — direction A)
+ *    D13 = L298N IN4 (right motors — direction B)
+ *
+ *    Pins freed by disabled features:
+ *    D4  = Buzzer          — UNCOMMENT: BUZZER
+ *    D8  = Headlight LED   — UNCOMMENT: HEADLIGHT
+ *    A4  = Water level     — UNCOMMENT: WATER LEVEL
+ *
+ *  UART telemetry format (must match ESP32 readUART() parser):
+ *    temperature,humidity,fireDetected,flameDetected,gasLevel,motorRunning,pumpActive,robotStatus\n
+ *    Example: 28.5,0.0,0,1,340,1,1,Fighting Fire
+ *    humidity always sends 0.0 until HUMIDITY feature is enabled.
  *
  *  Libraries required:
  *    - DHT sensor library (Adafruit)
- *    - Adafruit Unified Sensor (Adafruit)
- *    - Servo (built-in)
- *
- *  Pin map (matches hardware-setup.md):
- *    D2  = Flame sensor LEFT  (active LOW)
- *    D3  = Flame sensor CENTER (active LOW)  ← also Servo signal
- *    D4  = Flame sensor RIGHT  (active LOW)  ← also Buzzer
- *    D5  = HC-SR04 TRIG
- *    D6  = HC-SR04 ECHO
- *    D7  = MQ-2 digital out
- *    D8  = DHT11 data
- *    D9  = White headlight LED
- *    D10 = L298N IN1 (left motors)
- *    D11 = L298N IN2 (left motors)
- *    D12 = L298N IN3 (right motors)
- *    D13 = L298N IN4 (right motors)
- *    A0  = MQ-2 analog (optional, for raw value)
- *    A1  = LDR (voltage divider)
- *    A2  = Relay IN (pump)
- *    A3  = Red LED
- *    A4  = Blue LED
- *
- *  NOTE: D3 is shared between Servo signal and Flame Center pin
- *  in this default mapping. If conflicts arise, move Servo to
- *  another PWM pin (D9) and shift headlight LED elsewhere.
+ *    - Adafruit Unified Sensor
+ *    - Servo (built-in Arduino)
  * ============================================================
  */
 
 #include <DHT.h>
 #include <Servo.h>
 
-// ── Pin Definitions ─────────────────────────────────────────
+// ── Pin Definitions ──────────────────────────────────────────
 
-// Flame sensors (active LOW = flame detected)
-#define FLAME_LEFT    2
-#define FLAME_CENTER  3
-#define FLAME_RIGHT   4
+// Analog sensor inputs — A0 to A3 active
+#define MQ2_PIN          A0  // MQ-2 gas sensor raw analog
+#define FLAME_LEFT_PIN   A1  // Flame sensor left   — lower = more flame
+#define FLAME_CENTER_PIN A2  // Flame sensor center
+#define FLAME_RIGHT_PIN  A3  // Flame sensor right
 
-// Ultrasonic sensor HC-SR04
-#define TRIG_PIN      5
-#define ECHO_PIN      6
+// UNCOMMENT: WATER LEVEL — also uncomment A4 usage in readSensors()
+// #define WATER_LEVEL_PIN  A4
 
-// MQ-2 smoke/gas sensor
-#define MQ2_DO_PIN    7
-#define MQ2_AO_PIN    A0   // optional analog reading
+// Digital output pins
+#define RELAY_PIN        2   // Water pump relay — active LOW
+#define SERVO_PIN        3   // Nozzle servo PWM signal
 
-// DHT11 temperature & humidity
-#define DHT_PIN       8
-#define DHT_TYPE      DHT11
+// UNCOMMENT: BUZZER — also uncomment tone()/noTone() calls below
+// #define BUZZER_PIN       4
 
-// Lighting
-#define HEADLIGHT_PIN 9    // white LED for dark environments
+#define TRIG_PIN         5   // HC-SR04 trigger
+#define ECHO_PIN         6   // HC-SR04 echo
+#define DHT_PIN          7   // DHT11 data
 
-// L298N motor driver
-#define IN1           10   // left  motors direction A
-#define IN2           11   // left  motors direction B
-#define IN3           12   // right motors direction A
-#define IN4           13   // right motors direction B
+// UNCOMMENT: HEADLIGHT — also uncomment adjustHeadlight() body and call in loop()
+// #define HEADLIGHT_PIN    8
 
-// LDR light sensor (analog, voltage divider)
-#define LDR_PIN       A1
+#define LED_RED_PIN      9   // Red alert LED
 
-// Relay (controls water pump) — active LOW on most relay modules
-#define RELAY_PIN     A2
+// L298N motor driver — full speed via digitalWrite only
+#define IN1              10  // Left  motors — direction A
+#define IN2              11  // Left  motors — direction B
+#define IN3              12  // Right motors — direction A
+#define IN4              13  // Right motors — direction B
 
-// Alert LEDs
-#define LED_RED       A3
-#define LED_BLUE      A4
+// ── Sensor Thresholds ────────────────────────────────────────
 
-// Servo for nozzle sweep — reassign if D3 conflicts
-#define SERVO_PIN     3
+/*
+ *  FLAME_THRESHOLD:
+ *    Analog value BELOW this = flame detected.
+ *    Flame sensor outputs lower voltage when it sees IR light.
+ *    Tune by pointing a lighter at sensor and reading Serial monitor.
+ *    Default: 500 (mid-scale of 0–1023).
+ *
+ *  GAS_DANGER_THRESHOLD:
+ *    Analog value ABOVE this = dangerous gas/smoke level.
+ *    MQ-2 outputs higher voltage with more gas present.
+ *    Default: 400. Tune in your environment (clean air baseline).
+ *
+ *  WATER_LOW_THRESHOLD: (used only when WATER LEVEL is enabled)
+ *    Analog value BELOW this = tank too low to run pump.
+ */
+#define FLAME_THRESHOLD      500
+#define GAS_DANGER_THRESHOLD 400
+// #define WATER_LOW_THRESHOLD  200   // UNCOMMENT: WATER LEVEL
 
-// ── Tunable Parameters ──────────────────────────────────────
+// ── Timing Parameters ────────────────────────────────────────
 
-#define OBSTACLE_THRESHOLD_CM   20    // stop and avoid if closer than this
-#define LDR_DARK_THRESHOLD      400   // analog value below = dark (tune for your LDR)
-#define PATROL_SPEED            150   // motor PWM 0-255 during patrol
-#define TURN_SPEED              130   // motor PWM during turns
-#define SERVO_CENTER            90    // nozzle home position (degrees)
-#define SERVO_SWEEP_MIN         60    // nozzle left limit
-#define SERVO_SWEEP_MAX         120   // nozzle right limit
-#define SERVO_SWEEP_STEP        2     // degrees per sweep step
-#define SERVO_SWEEP_DELAY_MS    15    // ms between steps (smaller = faster sweep)
-#define ALIGN_TURN_DURATION_MS  150   // how long to turn per alignment step
-#define REVERSE_DURATION_MS     300   // how long to reverse on obstacle
-#define TURN_DURATION_MS        400   // how long to turn on obstacle
-#define UART_INTERVAL_MS        500   // telemetry send interval to ESP32
-#define LED_BLINK_INTERVAL_MS   200   // alert LED blink speed
+#define OBSTACLE_THRESHOLD_CM  20   // stop/avoid if object closer than this (cm)
+#define SERVO_CENTER           90   // nozzle home position (degrees)
+#define SERVO_SWEEP_MIN        60   // nozzle left sweep limit
+#define SERVO_SWEEP_MAX        120  // nozzle right sweep limit
+#define SERVO_SWEEP_STEP       2    // degrees per sweep step
+#define SERVO_SWEEP_DELAY_MS   15   // ms between each servo step
+#define ALIGN_TURN_MS          150  // ms to turn per alignment step
+#define REVERSE_MS             300  // ms to reverse during obstacle avoidance
+#define TURN_MS                400  // ms to turn during obstacle avoidance
+#define UART_INTERVAL_MS       500  // ms between telemetry packets to ESP32
+#define LED_BLINK_MS           200  // ms between red LED blink toggles
 
-// ── Global Objects ───────────────────────────────────────────
+// ── Default Sensor Values ────────────────────────────────────
+/*
+ *  These defaults are sent over UART if a sensor read fails or
+ *  returns an invalid value (e.g. DHT11 returns NaN on startup).
+ *  ESP32 dashboard will display these instead of garbage values.
+ */
+#define DEFAULT_TEMPERATURE  0.0
+#define DEFAULT_HUMIDITY     0.0   // always used — humidity disabled
+#define DEFAULT_GAS_LEVEL    0
+#define DEFAULT_DISTANCE     999.0
 
-DHT   dht(DHT_PIN, DHT_TYPE);
+// ── DHT Sensor ───────────────────────────────────────────────
+
+#define DHT_TYPE DHT11
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// ── Servo ────────────────────────────────────────────────────
+
 Servo nozzleServo;
 
 // ── Global State ─────────────────────────────────────────────
 
-float   temperature     = 0.0;
-float   humidity        = 0.0;
-float   distanceCm      = 0.0;
-bool    flameLeft       = false;
-bool    flameCenter     = false;
-bool    flameRight      = false;
-bool    smokeDetected   = false;
-bool    isDark          = false;
-bool    alertActive     = false;
+float   temperature   = DEFAULT_TEMPERATURE;
+float   distanceCm    = DEFAULT_DISTANCE;
+int     gasLevel      = DEFAULT_GAS_LEVEL;
+
+// Flame sensor raw analog values
+int     flameLeftRaw    = 1023;  // 1023 = no flame (safe default)
+int     flameCenterRaw  = 1023;
+int     flameRightRaw   = 1023;
+
+// Processed boolean flame flags
+bool    flameLeft     = false;
+bool    flameCenter   = false;
+bool    flameRight    = false;
+bool    smokeDetected = false;
+
+// UNCOMMENT: WATER LEVEL
+// int  waterLevel   = 1023;     // 1023 = full tank (safe default)
+// bool waterLow     = false;
+
+// Robot state for telemetry
+bool    motorRunning  = false;
+bool    pumpActive    = false;
+String  robotStatus   = "Standby";
 
 // Timing
-unsigned long lastUartSend      = 0;
-unsigned long lastLedBlink      = 0;
-bool          ledBlinkState     = false;
+unsigned long lastUartSend  = 0;
+unsigned long lastLedBlink  = 0;
+bool          ledBlinkState = false;
 
-// Turn direction alternates each obstacle to avoid looping
+// Obstacle avoidance — alternate turn direction to avoid looping
 bool turnLeftNext = true;
 
-// ── setup() ─────────────────────────────────────────────────
+// ── setup() ──────────────────────────────────────────────────
 
 void setup() {
-  // UART to ESP32-CAM at 9600 baud
+  /*
+   *  Initialize UART at 9600 baud — must match ESP32 Serial2.begin(9600).
+   *  Configure all pins, set safe output states, home the servo,
+   *  wait 2 s for sensors to stabilise, then begin forward patrol.
+   */
   Serial.begin(9600);
 
-  // Sensor pins
-  pinMode(FLAME_LEFT,   INPUT);
-  pinMode(FLAME_CENTER, INPUT);
-  pinMode(FLAME_RIGHT,  INPUT);
-  pinMode(TRIG_PIN,     OUTPUT);
-  pinMode(ECHO_PIN,     INPUT);
-  pinMode(MQ2_DO_PIN,   INPUT);
-  pinMode(LDR_PIN,      INPUT);
+  // Digital output pins
+  pinMode(RELAY_PIN,   OUTPUT);
+  pinMode(TRIG_PIN,    OUTPUT);
+  pinMode(LED_RED_PIN, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
 
-  // Output pins
-  pinMode(IN1,          OUTPUT);
-  pinMode(IN2,          OUTPUT);
-  pinMode(IN3,          OUTPUT);
-  pinMode(IN4,          OUTPUT);
-  pinMode(RELAY_PIN,    OUTPUT);
-  pinMode(LED_RED,      OUTPUT);
-  pinMode(LED_BLUE,     OUTPUT);
-  pinMode(HEADLIGHT_PIN,OUTPUT);
+  // UNCOMMENT: HEADLIGHT
+  // pinMode(HEADLIGHT_PIN, OUTPUT);
+  // digitalWrite(HEADLIGHT_PIN, LOW);
 
-  // Safe initial states
+  // UNCOMMENT: BUZZER
+  // pinMode(BUZZER_PIN, OUTPUT);
+  // digitalWrite(BUZZER_PIN, LOW);
+
+  // Safe initial states — everything off
   stopMotors();
-  digitalWrite(RELAY_PIN,     HIGH);  // relay off (active LOW module)
-  digitalWrite(LED_RED,       LOW);
-  digitalWrite(LED_BLUE,      LOW);
-  digitalWrite(HEADLIGHT_PIN, LOW);
+  digitalWrite(RELAY_PIN,   HIGH);  // relay OFF (active LOW module)
+  digitalWrite(LED_RED_PIN, LOW);
 
-  // Servo — attach and move to center/home
+  // Attach servo and move to home position
   nozzleServo.attach(SERVO_PIN);
   nozzleServo.write(SERVO_CENTER);
 
-  // DHT sensor startup
+  // Start DHT11
   dht.begin();
 
-  // Short pause for sensors to stabilise, then begin patrol
+  // Wait for sensors to stabilise before starting patrol
   delay(2000);
-  moveForward(PATROL_SPEED);
+
+  // Begin patrol
+  moveForward();
+  motorRunning = true;
+  robotStatus  = "Patrolling";
 
   Serial.println("FIREBOT_READY");
 }
 
-// ── loop() ──────────────────────────────────────────────────
-/*
- *  Main control loop mirrors the operational flowchart:
- *
- *  1. Read all sensors
- *  2. Send telemetry to ESP32 (every UART_INTERVAL_MS)
- *  3. Obstacle? → avoid and restart loop
- *  4. Flame or smoke? → enter High Alert
- *     4a. Align to flame
- *     4b. Suppress until extinguished
- *     4c. Resume patrol
- *  5. Otherwise → check darkness, keep patrolling
- */
-void loop() {
+// ── loop() ───────────────────────────────────────────────────
 
-  // ── Phase 2: Read sensors ──────────────────────────────
+void loop() {
+  /*
+   *  Main control cycle — runs continuously:
+   *  1. Read all active sensors
+   *  2. Send telemetry to ESP32 on interval
+   *  3. Obstacle detected?  → avoid and restart loop
+   *  4. Flame or gas alert? → High Alert → align → suppress → resume
+   *  5. Normal state        → keep patrolling
+   */
+
   readSensors();
 
-  // ── Phase 2: Send telemetry to ESP32 ──────────────────
+  // Send telemetry packet every UART_INTERVAL_MS
   if (millis() - lastUartSend >= UART_INTERVAL_MS) {
     sendTelemetry();
     lastUartSend = millis();
   }
 
-  // ── Phase 3: Obstacle avoidance ───────────────────────
+  // Obstacle avoidance has highest priority
   if (obstacleDetected()) {
     avoidObstacle();
-    return;  // restart loop — re-read sensors immediately
-  }
-
-  // ── Phase 4/5: Fire or smoke detection ────────────────
-  if (flameDetected() || smokeDetected) {
-    enterHighAlert();       // Phase 5 — stop, buzzers, LEDs
-    alignToFlame();         // Phase 6+7 — turn until centered
-    suppressFire();         // Phase 8+9 — pump + sweep until clear
-    resumePatrol();         // back to normal
     return;
   }
 
-  // ── Phase 4: Normal patrol ─────────────────────────────
-  checkDarkness();           // optional headlight control
-  moveForward(PATROL_SPEED); // keep moving
+  // Fire or gas detection — enter suppression sequence
+  if (flameDetected() || smokeDetected) {
+    enterHighAlert();
+    alignToFlame();
+    suppressFire();
+    resumePatrol();
+    return;
+  }
+
+  // Normal patrol
+  // UNCOMMENT: HEADLIGHT — also fill in adjustHeadlight() body below
+  // adjustHeadlight();
+
+  moveForward();
+  motorRunning = true;
+  robotStatus  = "Patrolling";
 }
 
 // ════════════════════════════════════════════════════════════
-//  SENSOR FUNCTIONS
+//  SENSOR READING
 // ════════════════════════════════════════════════════════════
 
-/*
- *  readSensors()
- *  Reads all sensors and updates global state variables.
- *  Called every loop iteration.
- */
 void readSensors() {
-  // DHT11 — temperature and humidity
+  /*
+   *  Reads all active sensors into global variables.
+   *  On invalid reads, global keeps its last valid value
+   *  or the DEFAULT_x constant set at startup.
+   *
+   *  Flame sensors: lower analog value = stronger flame signal.
+   *  MQ-2: higher analog value = more gas present.
+   */
+
+  // ── DHT11 — temperature only ──────────────────────────────
   float t = dht.readTemperature();
-  float h = dht.readHumidity();
-  if (!isnan(t)) temperature = t;
-  if (!isnan(h)) humidity    = h;
+  if (!isnan(t)) {
+    temperature = t;
+  }
+  // If isnan(t): temperature keeps its last valid value.
+  // On very first read failure it stays DEFAULT_TEMPERATURE (0.0).
 
-  // HC-SR04 — distance in cm
-  distanceCm = readUltrasonic();
+  // UNCOMMENT: HUMIDITY — remove the line above and use both lines below
+  // float t = dht.readTemperature();
+  // float h = dht.readHumidity();
+  // if (!isnan(t)) temperature = t;
+  // if (!isnan(h)) humidity    = h;
 
-  // Flame sensors — LOW = flame detected (active LOW)
-  flameLeft   = (digitalRead(FLAME_LEFT)   == LOW);
-  flameCenter = (digitalRead(FLAME_CENTER) == LOW);
-  flameRight  = (digitalRead(FLAME_RIGHT)  == LOW);
+  // ── HC-SR04 — distance ────────────────────────────────────
+  float d = readUltrasonic();
+  if (d > 0) {
+    distanceCm = d;
+  }
+  // If 0 returned (sensor error): keep last value.
+  // readUltrasonic() returns 999.0 for open space (no echo), which is valid.
 
-  // MQ-2 — HIGH = smoke/gas above threshold
-  smokeDetected = (digitalRead(MQ2_DO_PIN) == HIGH);
+  // ── MQ-2 — gas level ─────────────────────────────────────
+  int g = analogRead(MQ2_PIN);
+  if (g >= 0 && g <= 1023) {
+    gasLevel = g;
+  }
+  smokeDetected = (gasLevel > GAS_DANGER_THRESHOLD);
 
-  // LDR — low analog value = dark environment
-  isDark = (analogRead(LDR_PIN) < LDR_DARK_THRESHOLD);
+  // ── Flame sensors — analog ────────────────────────────────
+  flameLeftRaw   = analogRead(FLAME_LEFT_PIN);
+  flameCenterRaw = analogRead(FLAME_CENTER_PIN);
+  flameRightRaw  = analogRead(FLAME_RIGHT_PIN);
+
+  // Lower value = more IR light = flame present
+  flameLeft   = (flameLeftRaw   < FLAME_THRESHOLD);
+  flameCenter = (flameCenterRaw < FLAME_THRESHOLD);
+  flameRight  = (flameRightRaw  < FLAME_THRESHOLD);
+
+  // UNCOMMENT: WATER LEVEL
+  // waterLevel = analogRead(WATER_LEVEL_PIN);
+  // waterLow   = (waterLevel < WATER_LOW_THRESHOLD);
 }
 
-/*
- *  readUltrasonic()
- *  Sends a pulse on TRIG and measures echo duration.
- *  Returns distance in centimetres.
- *  Returns 999 if no echo received (out of range).
- */
+// ────────────────────────────────────────────────────────────
+
 float readUltrasonic() {
+  /*
+   *  Sends 10 µs trigger pulse, measures echo duration.
+   *  Returns distance in cm.
+   *  Returns 999.0 if no echo received (open space / out of range).
+   *  Returns 0.0  if pulseIn times out (sensor error).
+   */
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
   digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
 
-  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // 30ms timeout
-  if (duration == 0) return 999.0;                // no echo = open space
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // 30 ms timeout
+  if (duration == 0) return 0.0;                  // timeout — sensor error
   return (duration * 0.0343) / 2.0;
 }
 
-/*
- *  obstacleDetected()
- *  Returns true if something is within the obstacle threshold.
- */
+// ────────────────────────────────────────────────────────────
+
 bool obstacleDetected() {
-  return (distanceCm > 0 && distanceCm < OBSTACLE_THRESHOLD_CM);
+  /*
+   *  Returns true if object is within OBSTACLE_THRESHOLD_CM.
+   *  distanceCm == 999 means open space — not an obstacle.
+   *  distanceCm == 0   means sensor error — not treated as obstacle.
+   */
+  return (distanceCm > 0 &&
+          distanceCm < OBSTACLE_THRESHOLD_CM &&
+          distanceCm != 999.0);
 }
 
-/*
- *  flameDetected()
- *  Returns true if ANY flame sensor is triggered.
- */
+// ────────────────────────────────────────────────────────────
+
 bool flameDetected() {
+  // Returns true if ANY flame sensor is triggered
   return (flameLeft || flameCenter || flameRight);
 }
 
 // ════════════════════════════════════════════════════════════
-//  TELEMETRY
+//  UART TELEMETRY
 // ════════════════════════════════════════════════════════════
 
-/*
- *  sendTelemetry()
- *  Sends a comma-delimited data packet to the ESP32-CAM via UART.
- *
- *  Format:  T:28.5,H:62.3,D:45.0,F:1,S:0\n
- *    T = temperature (°C)
- *    H = humidity (%)
- *    D = distance (cm)
- *    F = flame detected (0/1)
- *    S = smoke detected (0/1)
- */
 void sendTelemetry() {
-  Serial.print("T:");  Serial.print(temperature, 1);
-  Serial.print(",H:"); Serial.print(humidity, 1);
-  Serial.print(",D:"); Serial.print(distanceCm, 1);
-  Serial.print(",F:"); Serial.print(flameDetected() ? 1 : 0);
-  Serial.print(",S:"); Serial.println(smokeDetected ? 1 : 0);
+  /*
+   *  Sends one comma-delimited line to ESP32-CAM.
+   *
+   *  Format matches ESP32 readUART() parser field order exactly:
+   *    [0] temperature   float  — degrees C, or 0.0 on sensor fail
+   *    [1] humidity      float  — always 0.0 (disabled); enable HUMIDITY
+   *    [2] fireDetected  int    — 1 if smoke above gas threshold
+   *    [3] flameDetected int    — 1 if any flame sensor triggered
+   *    [4] gasLevel      int    — raw MQ-2 analog 0–1023
+   *    [5] motorRunning  int    — 1 if motors are active
+   *    [6] pumpActive    int    — 1 if pump relay is ON
+   *    [7] robotStatus   String — Patrolling / Fighting Fire / Standby / Avoiding
+   *
+   *  All fields send a defined default value on sensor failure
+   *  so the ESP32 dashboard always receives a valid packet.
+   */
+  Serial.print(temperature, 1);
+  Serial.print(",");
+  Serial.print(DEFAULT_HUMIDITY, 1);      // humidity placeholder — always 0.0
+  Serial.print(",");
+  Serial.print(smokeDetected  ? 1 : 0);  // fireDetected field = smoke flag
+  Serial.print(",");
+  Serial.print(flameDetected() ? 1 : 0);
+  Serial.print(",");
+  Serial.print(gasLevel);
+  Serial.print(",");
+  Serial.print(motorRunning  ? 1 : 0);
+  Serial.print(",");
+  Serial.print(pumpActive    ? 1 : 0);
+  Serial.print(",");
+  Serial.println(robotStatus);           // println adds required \n terminator
 }
 
 // ════════════════════════════════════════════════════════════
-//  OBSTACLE AVOIDANCE  (Phase 3)
+//  OBSTACLE AVOIDANCE
 // ════════════════════════════════════════════════════════════
 
-/*
- *  avoidObstacle()
- *  Stops, reverses briefly, then turns to find a clear path.
- *  Alternates turn direction each call to avoid circling.
- */
 void avoidObstacle() {
+  /*
+   *  Stop → reverse → turn (alternating L/R) → resume forward.
+   *  Alternating turn direction prevents the robot circling in place.
+   */
+  stopMotors();
+  motorRunning = false;
+  robotStatus  = "Avoiding";
+  delay(100);
+
+  moveBackward();
+  delay(REVERSE_MS);
   stopMotors();
   delay(100);
 
-  // Reverse
-  moveBackward(PATROL_SPEED);
-  delay(REVERSE_DURATION_MS);
-  stopMotors();
-  delay(100);
-
-  // Turn (alternate direction each time)
   if (turnLeftNext) {
-    turnLeft(TURN_SPEED);
+    turnLeft();
   } else {
-    turnRight(TURN_SPEED);
+    turnRight();
   }
   turnLeftNext = !turnLeftNext;
-  delay(TURN_DURATION_MS);
+  delay(TURN_MS);
 
   stopMotors();
   delay(100);
-  moveForward(PATROL_SPEED);
+
+  moveForward();
+  motorRunning = true;
+  robotStatus  = "Patrolling";
 }
 
 // ════════════════════════════════════════════════════════════
-//  HIGH ALERT MODE  (Phase 5)
+//  HIGH ALERT ENTRY
 // ════════════════════════════════════════════════════════════
 
-/*
- *  enterHighAlert()
- *  Called the moment fire or smoke is detected.
- *  Stops the robot, starts visual/audio alerts.
- *  The ESP32 will receive the updated telemetry (F:1 or S:1)
- *  on the next UART send and trigger Telegram + dashboard alert.
- */
 void enterHighAlert() {
-  alertActive = true;
+  /*
+   *  Stops robot, activates red LED, sends immediate telemetry
+   *  so ESP32 triggers Telegram alert without waiting for the
+   *  next scheduled UART_INTERVAL_MS window.
+   */
   stopMotors();
+  motorRunning = false;
+  robotStatus  = "Fighting Fire";
 
-  // Force immediate telemetry so ESP32 triggers Telegram alert fast
+  // Immediate telemetry — ESP32 fires Telegram alert on this packet
   sendTelemetry();
   lastUartSend = millis();
 
-  // Start buzzer and LEDs — will be maintained in the loops below
-  tone(FLAME_RIGHT, 1000);  // 1kHz tone on buzzer (reusing D4 as tone pin)
-  digitalWrite(LED_RED,  HIGH);
-  digitalWrite(LED_BLUE, LOW);
+  // UNCOMMENT: BUZZER
+  // tone(BUZZER_PIN, 1000);  // 1 kHz alert tone
+
+  digitalWrite(LED_RED_PIN, HIGH);
 }
 
 // ════════════════════════════════════════════════════════════
-//  FLAME ALIGNMENT  (Phase 6 + 7)
+//  FLAME ALIGNMENT
 // ════════════════════════════════════════════════════════════
 
-/*
- *  alignToFlame()
- *  Turns the robot until the CENTER flame sensor is the
- *  dominant (or only) active sensor.
- *
- *  Logic:
- *    - If only RIGHT is active → turn right
- *    - If only LEFT  is active → turn left
- *    - If CENTER is active (alone or strongest) → stop turning
- *    - If no flame detected → stop (may have been smoke only)
- *
- *  Blinks alert LEDs during alignment.
- */
 void alignToFlame() {
-  // Re-read before starting alignment
+  /*
+   *  Rotates robot until CENTER flame sensor is the dominant sensor.
+   *
+   *  Per-cycle logic:
+   *    flameCenter active               → stop, aligned
+   *    flameRight only                  → turn right toward fire
+   *    flameLeft  only                  → turn left  toward fire
+   *    both left and right, no center   → nudge right to break symmetry
+   *    no flame at all                  → exit (smoke-only trigger)
+   *
+   *  Sends telemetry on interval during alignment loop.
+   */
   readSensors();
-
-  // If no flame at all (smoke-only trigger), skip alignment
-  if (!flameDetected()) return;
+  if (!flameDetected()) return;  // smoke-only trigger — skip alignment
 
   while (true) {
     readSensors();
-    blinkAlertLeds(); // keep LEDs blinking during alignment
+    blinkAlertLed();
 
-    // Aligned — center sensor active
     if (flameCenter) {
+      // Aligned to flame
       stopMotors();
       break;
     }
 
-    // Fire is to the right → turn right
     if (flameRight && !flameLeft) {
-      turnRight(TURN_SPEED);
-      delay(ALIGN_TURN_DURATION_MS);
+      // Fire is to the right
+      turnRight();
+      delay(ALIGN_TURN_MS);
       stopMotors();
       delay(50);
-    }
-
-    // Fire is to the left → turn left
-    else if (flameLeft && !flameRight) {
-      turnLeft(TURN_SPEED);
-      delay(ALIGN_TURN_DURATION_MS);
+    } else if (flameLeft && !flameRight) {
+      // Fire is to the left
+      turnLeft();
+      delay(ALIGN_TURN_MS);
       stopMotors();
       delay(50);
-    }
-
-    // Both sides equally active — nudge right by default
-    else if (flameLeft && flameRight) {
-      turnRight(TURN_SPEED);
-      delay(ALIGN_TURN_DURATION_MS / 2);
+    } else if (flameLeft && flameRight) {
+      // Both sides equally lit — nudge right to break symmetry
+      turnRight();
+      delay(ALIGN_TURN_MS / 2);
       stopMotors();
       delay(50);
-    }
-
-    // No flame — fire may have moved or smoke-only; exit
-    else {
+    } else {
+      // No flame — fire gone or smoke-only; exit alignment
       stopMotors();
       break;
     }
 
-    // Send telemetry update during alignment loop
+    // Keep ESP32 dashboard updated during alignment
     if (millis() - lastUartSend >= UART_INTERVAL_MS) {
       sendTelemetry();
       lastUartSend = millis();
@@ -442,32 +533,48 @@ void alignToFlame() {
 }
 
 // ════════════════════════════════════════════════════════════
-//  FIRE SUPPRESSION  (Phase 8 + 9)
+//  FIRE SUPPRESSION
 // ════════════════════════════════════════════════════════════
 
-/*
- *  suppressFire()
- *  Activates the water pump via relay and sweeps the nozzle
- *  servo back and forth between SERVO_SWEEP_MIN and SERVO_SWEEP_MAX.
- *
- *  Continues until ALL three flame sensors read clear (HIGH).
- *  Keeps sending telemetry and blinking LEDs throughout.
- */
 void suppressFire() {
+  /*
+   *  Activates pump relay and sweeps nozzle servo until all flame
+   *  sensors read clear AND gas level drops below threshold.
+   *
+   *  Water level check is disabled. To protect the pump from dry
+   *  running, UNCOMMENT: WATER LEVEL block inside this function.
+   */
   stopMotors();
+  motorRunning = false;
 
-  // Activate pump (relay active LOW)
+  // Activate pump — no water level check in this build
   digitalWrite(RELAY_PIN, LOW);
+  pumpActive = true;
 
-  int   servoPos  = SERVO_CENTER;
-  int   sweepDir  = 1;  // 1 = sweeping toward max, -1 = toward min
+  // UNCOMMENT: WATER LEVEL — replace the two lines above with:
+  // if (!waterLow) {
+  //   digitalWrite(RELAY_PIN, LOW);
+  //   pumpActive = true;
+  // } else {
+  //   Serial.println("WARN:WATER_LOW");
+  //   pumpActive = false;
+  // }
 
-  // Keep suppressing until flame is gone
-  while (flameDetected()) {
+  int servoPos = SERVO_CENTER;
+  int sweepDir = 1;  // 1 = sweeping toward max, -1 = toward min
+
+  while (flameDetected() || smokeDetected) {
     readSensors();
-    blinkAlertLeds();
+    blinkAlertLed();
 
-    // Step servo
+    // UNCOMMENT: WATER LEVEL — cut pump mid-run if tank empties
+    // if (waterLow && pumpActive) {
+    //   digitalWrite(RELAY_PIN, HIGH);
+    //   pumpActive = false;
+    //   Serial.println("WARN:WATER_EMPTY");
+    // }
+
+    // Sweep nozzle servo back and forth
     servoPos += sweepDir * SERVO_SWEEP_STEP;
     if (servoPos >= SERVO_SWEEP_MAX) {
       servoPos = SERVO_SWEEP_MAX;
@@ -486,106 +593,118 @@ void suppressFire() {
     }
   }
 
-  // Flame gone — shut everything off
-  digitalWrite(RELAY_PIN, HIGH); // pump OFF
+  // Fire out — pump off, nozzle home
+  digitalWrite(RELAY_PIN, HIGH);
+  pumpActive = false;
   nozzleServo.write(SERVO_CENTER);
 }
 
 // ════════════════════════════════════════════════════════════
-//  RESUME PATROL  (Post-suppression)
+//  RESUME PATROL
 // ════════════════════════════════════════════════════════════
 
-/*
- *  resumePatrol()
- *  Clears the alert state, turns off all alert outputs,
- *  sends a "fire extinguished" telemetry packet, and
- *  restarts forward patrol.
- */
 void resumePatrol() {
-  alertActive = false;
+  /*
+   *  Clears alert state, silences all alert outputs, sends an
+   *  immediate clear-status telemetry packet so ESP32 sends the
+   *  Telegram all-clear, then restarts forward patrol.
+   */
 
-  noTone(FLAME_RIGHT);          // buzzer off
-  digitalWrite(LED_RED,  LOW);
-  digitalWrite(LED_BLUE, LOW);
+  // UNCOMMENT: BUZZER
+  // noTone(BUZZER_PIN);
 
-  // Send clear status — ESP32 will update dashboard + Telegram
-  // Manually override flags so the packet shows F:0
-  // (sensors should already read clear, but send immediately)
+  digitalWrite(LED_RED_PIN, LOW);
+
+  robotStatus  = "Standby";
+  motorRunning = false;
+  pumpActive   = false;
+
+  // Immediate clear packet — ESP32 fires Telegram all-clear on this
   sendTelemetry();
   lastUartSend = millis();
 
   delay(500);
-  moveForward(PATROL_SPEED);
+
+  moveForward();
+  motorRunning = true;
+  robotStatus  = "Patrolling";
 }
 
 // ════════════════════════════════════════════════════════════
-//  OPTIONAL: DARKNESS CHECK  (Phase 4)
+//  HEADLIGHT  (disabled)
 // ════════════════════════════════════════════════════════════
 
-/*
- *  checkDarkness()
- *  Turns the white headlight LED on if the LDR detects low
- *  ambient light, off otherwise.
- */
-void checkDarkness() {
-  digitalWrite(HEADLIGHT_PIN, isDark ? HIGH : LOW);
-}
+// UNCOMMENT: HEADLIGHT
+// To enable:
+//   1. Uncomment #define HEADLIGHT_PIN 8 near top
+//   2. Uncomment pinMode + digitalWrite in setup()
+//   3. Uncomment adjustHeadlight() call in loop()
+//   4. Add LDR on a free analog pin and fill in the body below
+//
+// void adjustHeadlight() {
+//   int ldrValue = analogRead(YOUR_LDR_PIN);
+//   digitalWrite(HEADLIGHT_PIN, ldrValue < LDR_DARK_THRESHOLD ? HIGH : LOW);
+// }
 
 // ════════════════════════════════════════════════════════════
-//  ALERT LED BLINK HELPER
+//  ALERT LED BLINK
 // ════════════════════════════════════════════════════════════
 
-/*
- *  blinkAlertLeds()
- *  Non-blocking alternating red/blue blink.
- *  Uses millis() timing — safe to call inside loops.
- */
-void blinkAlertLeds() {
-  if (millis() - lastLedBlink >= LED_BLINK_INTERVAL_MS) {
+void blinkAlertLed() {
+  /*
+   *  Non-blocking red LED blink using millis() — safe inside loops.
+   *  Does not use delay() so sensor reads and servo steps are unaffected.
+   */
+  if (millis() - lastLedBlink >= LED_BLINK_MS) {
     ledBlinkState = !ledBlinkState;
-    digitalWrite(LED_RED,  ledBlinkState ? HIGH : LOW);
-    digitalWrite(LED_BLUE, ledBlinkState ? LOW  : HIGH);
+    digitalWrite(LED_RED_PIN, ledBlinkState ? HIGH : LOW);
     lastLedBlink = millis();
   }
 }
 
 // ════════════════════════════════════════════════════════════
-//  MOTOR CONTROL
+//  MOTOR CONTROL  (fixed full speed — no PWM)
 // ════════════════════════════════════════════════════════════
+
 /*
- *  All motor functions take a speed parameter (0–255 PWM).
- *  The L298N IN1/IN2 control left motor pair direction.
- *  The L298N IN3/IN4 control right motor pair direction.
+ *  Motors run at full speed via digitalWrite only.
+ *  ENA and ENB on L298N must be jumpered to 5V (always enabled).
  *
- *  HIGH/LOW on IN pins sets direction; ENA/ENB control speed.
- *  If ENA/ENB are hard-wired HIGH, motors run at full speed
- *  regardless of the analogWrite below — connect ENA/ENB to
- *  PWM pins for variable speed control.
+ *  UNCOMMENT: SPEED CONTROL
+ *  To enable variable speed:
+ *    1. Connect ENA to a PWM pin (e.g. D3) and ENB to another (e.g. D9)
+ *    2. Add: #define ENA 3  and  #define ENB 9
+ *    3. Replace digitalWrite calls below with analogWrite(ENA/ENB, speed)
+ *    4. Add a speed parameter to each function signature
+ *    Example: void moveForward(int speed) { analogWrite(ENA, speed); ... }
  */
 
-void moveForward(int speed) {
-  analogWrite(IN1, speed); digitalWrite(IN2, LOW);
-  analogWrite(IN3, speed); digitalWrite(IN4, LOW);
+void moveForward() {
+  // Both motor pairs drive forward
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
 }
 
-void moveBackward(int speed) {
-  digitalWrite(IN1, LOW); analogWrite(IN2, speed);
-  digitalWrite(IN3, LOW); analogWrite(IN4, speed);
+void moveBackward() {
+  // Both motor pairs drive backward
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
 }
 
-void turnLeft(int speed) {
-  // Right motors forward, left motors stopped
-  analogWrite(IN3, speed); digitalWrite(IN4, LOW);
+void turnLeft() {
+  // Right side forward, left side stopped
   digitalWrite(IN1, LOW);  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
 }
 
-void turnRight(int speed) {
-  // Left motors forward, right motors stopped
-  analogWrite(IN1, speed); digitalWrite(IN2, LOW);
+void turnRight() {
+  // Left side forward, right side stopped
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
   digitalWrite(IN3, LOW);  digitalWrite(IN4, LOW);
 }
 
 void stopMotors() {
+  // All outputs LOW — motors coast to stop
   digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
   digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
 }
